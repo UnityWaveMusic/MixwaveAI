@@ -1,0 +1,125 @@
+name: Build MIXWAVE AI (Windows x64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  JUCE_TAG: "8.0.11"
+
+jobs:
+  build:
+    name: Windows x64 Release (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "vs2022",        os: windows-2022,   experimental: false }
+          - { name: "windows-latest", os: windows-latest, experimental: true }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch JUCE ${{ env.JUCE_TAG }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path third_party/JUCE/CMakeLists.txt)) {
+            git clone --depth 1 --branch $env:JUCE_TAG https://github.com/juce-framework/JUCE.git third_party/JUCE
+            if ($LASTEXITCODE -ne 0) { throw "Could not fetch JUCE tag $env:JUCE_TAG" }
+          }
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          $gen = ./scripts/select-generator.ps1
+          if (-not $gen) { throw "No Visual Studio generator detected" }
+          "Using generator: $gen"
+          "GENERATOR=$gen" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure (x64)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "$env:GENERATOR" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+
+      - name: Build Release
+        id: build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+
+      - name: IPC tests
+        id: tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
+
+      - name: Validate with pluginval (strictness 5)
+        id: pluginval
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force logs | Out-Null
+          gh release download --repo Tracktion/pluginval --pattern "*Windows*" --dir pluginval-dl
+          if ($LASTEXITCODE -ne 0) { throw "Could not download pluginval" }
+          $zip = Get-ChildItem pluginval-dl -Filter *.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath pluginval
+          $exe = Get-ChildItem pluginval -Recurse -Filter pluginval.exe | Select-Object -First 1
+          if (-not $exe) { throw "pluginval.exe not found in $($zip.Name)" }
+
+          $failed = $false
+          foreach ($p in @("build/plugins/track/MixwaveTrack_artefacts/Release/VST3/MIXWAVE AI Track.vst3",
+                           "build/plugins/hub/MixwaveHub_artefacts/Release/VST3/MIXWAVE AI Hub.vst3")) {
+            $full = (Resolve-Path $p).Path
+            $log = "logs/pluginval-" + (Split-Path $p -Leaf) + ".txt"
+            & $exe.FullName --strictness-level 5 --skip-gui-tests $full 2>&1 | Tee-Object -FilePath $log
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          if ($failed) { throw "pluginval reported failures (see logs artifact)" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "dist/MIXWAVE-AI-Phase1-Windows-x64"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item "build/plugins/track/MixwaveTrack_artefacts/Release/VST3/MIXWAVE AI Track.vst3" $out -Recurse
+          Copy-Item "build/plugins/hub/MixwaveHub_artefacts/Release/VST3/MIXWAVE AI Hub.vst3" $out -Recurse
+          Copy-Item packaging/README_INSTALL.txt "$out/README.txt"
+          Copy-Item packaging/install_binaries.ps1 "$out/install.ps1"
+          Compress-Archive -Path "$out/*" -DestinationPath dist/MIXWAVE-AI-Phase1-Windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MIXWAVE-AI-Phase1-Windows-x64-${{ matrix.name }}
+          path: dist/MIXWAVE-AI-Phase1-Windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ matrix.name }}
+          path: logs/
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          @"
+          ### MIXWAVE AI build (${{ matrix.name }})
+          | Step | Result |
+          |---|---|
+          | Build (Release x64) | ${{ steps.build.outcome }} |
+          | IPC tests | ${{ steps.tests.outcome }} |
+          | pluginval (strictness 5) | ${{ steps.pluginval.outcome }} |
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
